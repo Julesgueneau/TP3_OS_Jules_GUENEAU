@@ -54,10 +54,11 @@ socklen_t ls;
           /* definition de l'accuse de reception */
           const char *ar = "Bien reçu 5/5 !";
           
-          /* envoi de l'accuse de reception au client avec msg_confirm */
-          if (sendto(sid, ar, strlen(ar), MSG_CONFIRM, (struct sockaddr *)&Sock, ls) == -1) {
-              perror("sendto ar");
-          }
+          /* remplacement de msg_confirm par 0 pour compatibilite macos */
+        if (sendto(sid, ar, strlen(ar), 0, (struct sockaddr *)&Sock, ls) == -1) {
+        perror("sendto ack");
+        }
+
       }
     }
     return 0;
