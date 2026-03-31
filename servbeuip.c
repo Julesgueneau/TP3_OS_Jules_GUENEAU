@@ -35,12 +35,14 @@ int sid, nb_recv, i, known;
 struct sockaddr_in sock_conf;
 struct sockaddr_in sock;
 struct sockaddr_in bcast_addr;
+struct sockaddr_in dest_sock;
 socklen_t ls;
 char buf[LBUF+1];
 char msg_out[LBUF+1];
 int opt = 1;
 unsigned long sender_ip;
 char sender_pseudo[LBUF];
+char *pseudo_dest, *message_corps;
 
     /* verification de l argument */
     if (n != 2) {
@@ -106,12 +108,47 @@ char sender_pseudo[LBUF];
                 }
                 printf("------------------------------\n");
             }
+            /* cas code 4 : transfert de message prive */
+            else if (buf[0] == '4') {
+                pseudo_dest = buf + 6;
+                /* recherche du message apres le \0 du pseudo */
+                message_corps = pseudo_dest + strlen(pseudo_dest) + 1;
+                
+                int found = 0;
+                for (i = 0; i < user_count; i++) {
+                    if (strcmp(table[i].pseudo, pseudo_dest) == 0) {
+                        found = 1;
+                        bzero(&dest_sock, sizeof(dest_sock));
+                        dest_sock.sin_family = AF_INET;
+                        dest_sock.sin_port = htons(PORT);
+                        dest_sock.sin_addr.s_addr = htonl(table[i].ip);
+                        
+                        /* formatage du message de type 9 */
+                        snprintf(msg_out, LBUF, "9BEUIP%s", message_corps);
+                        sendto(sid, msg_out, strlen(msg_out), 0, (struct sockaddr *)&dest_sock, sizeof(dest_sock));
+                        break;
+                    }
+                }
+                if (!found) fprintf(stderr, "erreur : pseudo %s non trouve\n", pseudo_dest);
+            }
+            /* cas code 9 : reception d un message prive */
+            else if (buf[0] == '9') {
+                sender_ip = ntohl(sock.sin_addr.s_addr);
+                int found = 0;
+                for (i = 0; i < user_count; i++) {
+                    if (table[i].ip == sender_ip) {
+                        printf("Message de %s : %s\n", table[i].pseudo, buf + 6);
+                        found = 1;
+                        break;
+                    }
+                }
+                if (!found) printf("Message de %s (inconnu) : %s\n", addrip(sender_ip), buf + 6);
+            }
             /* cas codes 1 ou 2 : gestion des utilisateurs */
             else if (buf[0] == '1' || buf[0] == '2') {
                 sender_ip = ntohl(sock.sin_addr.s_addr);
                 strcpy(sender_pseudo, buf + 6);
                 
-                /* verification des doublons dans la table */
                 known = 0;
                 for (i = 0; i < user_count; i++) {
                     if (table[i].ip == sender_ip && strcmp(table[i].pseudo, sender_pseudo) == 0) {
@@ -120,7 +157,6 @@ char sender_pseudo[LBUF];
                     }
                 }
                 
-                /* enregistrement si nouvel utilisateur */
                 if (!known && user_count < MAX_USERS) {
                     table[user_count].ip = sender_ip;
                     strcpy(table[user_count].pseudo, sender_pseudo);
@@ -130,12 +166,9 @@ char sender_pseudo[LBUF];
 #endif
                 }
 
-                /* reponse par accuse de reception si broadcast recu */
                 if (buf[0] == '1') {
                     snprintf(msg_out, LBUF, "2BEUIP%s", p[1]);
-                    if (sendto(sid, msg_out, strlen(msg_out), 0, (struct sockaddr *)&sock, ls) == -1) {
-                        perror("sendto ack");
-                    }
+                    sendto(sid, msg_out, strlen(msg_out), 0, (struct sockaddr *)&sock, ls);
                 }
             }
         }
