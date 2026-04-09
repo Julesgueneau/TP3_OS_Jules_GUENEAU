@@ -42,7 +42,7 @@ char * addrip(unsigned long a) {
     return b;
 }
 
-/* fonction utilitaire pour creer un repertoire s il n existe pas */
+/* fonction utilitaire pour creer un repertoire */
 void verifier_repertoire(const char *chemin) {
     struct stat st = {0};
     if (stat(chemin, &st) == -1) {
@@ -112,7 +112,19 @@ void commande(char octet1, char *message, char *pseudo) {
             sendto(sid_global, msg_out, strlen(msg_out), 0, (struct sockaddr *)&dest_sock, sizeof(dest_sock));
         }
         printf("message envoye a tous.\n");
-    } 
+    }
+    else if (octet1 == '6') {
+        /* diffusion de la requete de fichier a tous les contacts (code 6) */
+        for (i = 0; i < user_count; i++) {
+            bzero(&dest_sock, sizeof(dest_sock));
+            dest_sock.sin_family = AF_INET;
+            dest_sock.sin_port = htons(PORT_BEUIP);
+            dest_sock.sin_addr.s_addr = htonl(table[i].ip);
+            snprintf(msg_out, LBUF, "6BEUIP%s", message);
+            sendto(sid_global, msg_out, strlen(msg_out), 0, (struct sockaddr *)&dest_sock, sizeof(dest_sock));
+        }
+        printf("requete de recherche pour '%s' envoyee au reseau.\n", message);
+    }
     else if (octet1 == '0') {
         for (i = 0; i < user_count; i++) {
             bzero(&dest_sock, sizeof(dest_sock));
@@ -142,24 +154,22 @@ void * serveur_udp(void * p) {
         nb_recv = recvfrom(sid_global, (void*)buf, LBUF, 0, (struct sockaddr *)&sock, &ls);
         
         if (nb_recv <= 0) break;
-        buf[nb_recv] = '\0';
         
+        /* on ne met pas de caractere de fin de chaine globalement car un fichier (code 7) peut contenir des octets nuls */
         if (nb_recv >= 6 && strncmp(buf + 1, "BEUIP", 5) == 0) {
             
-            if (buf[0] != '0' && buf[0] != '1' && buf[0] != '2' && buf[0] != '9') {
-                fprintf(stderr, "\nalerte securite : requete externe refusee (code %c)\n", buf[0]);
+            /* autorisation des nouveaux codes applicatifs 6 et 7 */
+            if (buf[0] != '0' && buf[0] != '1' && buf[0] != '2' && buf[0] != '9' && buf[0] != '6' && buf[0] != '7') {
                 continue;
             }
 
             pthread_mutex_lock(&mutex_table);
 
             if (buf[0] == '0') {
+                buf[nb_recv] = '\0';
                 sender_ip = ntohl(sock.sin_addr.s_addr);
                 for (i = 0; i < user_count; i++) {
                     if (table[i].ip == sender_ip) {
-#ifdef TRACE
-                        printf("\ndepart de : %s\n", table[i].pseudo);
-#endif
                         for (j = i; j < user_count - 1; j++) table[j] = table[j+1];
                         user_count--;
                         break;
@@ -167,6 +177,7 @@ void * serveur_udp(void * p) {
                 }
             }
             else if (buf[0] == '9') {
+                buf[nb_recv] = '\0';
                 sender_ip = ntohl(sock.sin_addr.s_addr);
                 known = 0;
                 char pseudo_exp[LBUF] = "inconnu";
@@ -186,7 +197,53 @@ void * serveur_udp(void * p) {
                 }
                 pthread_mutex_unlock(&mutex_msg);
             }
+            else if (buf[0] == '6') {
+                /* reception d une requete de fichier : on cherche en local */
+                buf[nb_recv] = '\0';
+                char filepath[256];
+                snprintf(filepath, sizeof(filepath), "reppub/%s", buf + 6);
+                FILE *f = fopen(filepath, "rb");
+                if (f != NULL) {
+                    char header[256];
+                    int hlen = snprintf(header, sizeof(header), "7BEUIP%s|", buf + 6);
+                    memcpy(msg_out, header, hlen);
+                    size_t bytes = fread(msg_out + hlen, 1, LBUF - hlen, f);
+                    fclose(f);
+                    
+                    /* envoi direct a l expediteur en reponse */
+                    sendto(sid_global, msg_out, hlen + bytes, 0, (struct sockaddr *)&sock, ls);
+                }
+            }
+            else if (buf[0] == '7') {
+                /* reception d un fichier depuis le reseau */
+                buf[nb_recv] = '\0'; /* precaution pour strchr */
+                char *delim = strchr(buf + 6, '|');
+                if (delim != NULL) {
+                    *delim = '\0';
+                    char *filename = buf + 6;
+                    char *content = delim + 1;
+                    int content_len = nb_recv - (content - buf);
+                    sender_ip = ntohl(sock.sin_addr.s_addr);
+                    
+                    char savepath[256];
+                    snprintf(savepath, sizeof(savepath), "reppub/%s/%s", addrip(sender_ip), filename);
+                    FILE *out = fopen(savepath, "wb");
+                    if (out != NULL) {
+                        fwrite(content, 1, content_len, out);
+                        fclose(out);
+                        
+                        /* notification a l utilisateur */
+                        pthread_mutex_lock(&mutex_msg);
+                        if (nb_msg_attente < MAX_MSGS) {
+                            snprintf(boite_reception[nb_msg_attente], LBUF, "[fichier] %s telecharge dans reppub/%s/", filename, addrip(sender_ip));
+                            nb_msg_attente++;
+                        }
+                        pthread_mutex_unlock(&mutex_msg);
+                    }
+                }
+            }
             else if (buf[0] == '1' || buf[0] == '2') {
+                buf[nb_recv] = '\0';
                 sender_ip = ntohl(sock.sin_addr.s_addr);
                 strcpy(sender_pseudo, buf + 6);
                 known = 0;
@@ -200,13 +257,8 @@ void * serveur_udp(void * p) {
                     strcpy(table[user_count].pseudo, sender_pseudo);
                     user_count++;
                     
-                    /* ETAPE 2.2 : creation du sous-repertoire pour cet utilisateur specifique */
                     snprintf(chemin_user, sizeof(chemin_user), "reppub/%s", addrip(sender_ip));
                     verifier_repertoire(chemin_user);
-
-#ifdef TRACE
-                    printf("\nnouveau contact : %s (%s)\n", sender_pseudo, addrip(sender_ip));
-#endif
                 }
                 if (buf[0] == '1') {
                     snprintf(msg_out, LBUF, "2BEUIP%s", pseudo_global);
@@ -257,8 +309,6 @@ int CommandeBEUIP(int n, char *p[]) {
         }
 
         strcpy(pseudo_global, p[2]);
-
-        /* ETAPE 2.2 : initialisation du repertoire racine de partage */
         verifier_repertoire("reppub");
 
         if ((sid_global = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)) < 0) {
@@ -318,12 +368,13 @@ int CommandeMESS(int n, char *p[]) {
         return 1;
     }
     if (n < 2) {
-        fprintf(stderr, "usage : mess list | mess all <msg> | mess <pseudo> <msg>\n");
+        fprintf(stderr, "usage : mess list | mess all <msg> | mess find <fichier> | mess <pseudo> <msg>\n");
         return 1;
     }
 
     if (strcmp(p[1], "list") == 0) commande('3', NULL, NULL);
     else if (strcmp(p[1], "all") == 0 && n >= 3) commande('5', p[2], NULL);
+    else if (strcmp(p[1], "find") == 0 && n >= 3) commande('6', p[2], NULL);
     else if (n >= 3) commande('4', p[2], p[1]);
 
     return 1;
@@ -358,7 +409,7 @@ int CommandePWD(int n, char *p[]) {
 }
 
 int CommandeVERS(int n, char *p[]) {
-    printf("biceps version 3.0 - fichiers\n");
+    printf("biceps version 3.1 - partage de fichiers\n");
     return 1;
 }
 
@@ -383,11 +434,11 @@ int main(int argc, char *argv[]) {
     while (1) {
         pthread_mutex_lock(&mutex_msg);
         if (nb_msg_attente > 0) {
-            printf("\n--- %d message(s) en attente ---\n", nb_msg_attente);
+            printf("\n--- %d notification(s) en attente ---\n", nb_msg_attente);
             for (k = 0; k < nb_msg_attente; k++) {
                 printf("> %s\n", boite_reception[k]);
             }
-            printf("--------------------------------\n");
+            printf("------------------------------------\n");
             nb_msg_attente = 0;
         }
         pthread_mutex_unlock(&mutex_msg);
