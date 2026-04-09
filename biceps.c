@@ -17,7 +17,7 @@
 #define HIST_FILE ".biceps_history"
 #define MAX_USERS 255
 
-/* variables globales partagees (serveur / shell) */
+/* variables globales partagees */
 struct user_info table[MAX_USERS];
 int user_count = 0;
 pthread_mutex_t mutex_table = PTHREAD_MUTEX_INITIALIZER;
@@ -35,6 +35,67 @@ char * addrip(unsigned long a) {
     return b;
 }
 
+/* fonction centralisee pour les commandes internes non securisees (etape 1.2) */
+void commande(char octet1, char *message, char *pseudo) {
+    int i, found;
+    struct sockaddr_in dest_sock;
+    char msg_out[LBUF+1];
+
+    /* protection de la lecture de la table */
+    pthread_mutex_lock(&mutex_table);
+
+    if (octet1 == '3') {
+        /* affichage de la liste */
+        printf("--- table des presents (%d) ---\n", user_count);
+        for (i = 0; i < user_count; i++) {
+            printf("%s : %s\n", table[i].pseudo, addrip(table[i].ip));
+        }
+    } 
+    else if (octet1 == '4') {
+        /* message a un pseudo (envoi code 9) */
+        found = 0;
+        for (i = 0; i < user_count; i++) {
+            if (strcmp(table[i].pseudo, pseudo) == 0) {
+                bzero(&dest_sock, sizeof(dest_sock));
+                dest_sock.sin_family = AF_INET;
+                dest_sock.sin_port = htons(PORT_BEUIP);
+                dest_sock.sin_addr.s_addr = htonl(table[i].ip);
+                snprintf(msg_out, LBUF, "9BEUIP%s", message);
+                sendto(sid_global, msg_out, strlen(msg_out), 0, (struct sockaddr *)&dest_sock, sizeof(dest_sock));
+                found = 1;
+                printf("message envoye a %s.\n", pseudo);
+                break;
+            }
+        }
+        if (!found) printf("erreur : pseudo %s inconnu.\n", pseudo);
+    } 
+    else if (octet1 == '5') {
+        /* message a tous (envoi code 9 individuel) */
+        for (i = 0; i < user_count; i++) {
+            bzero(&dest_sock, sizeof(dest_sock));
+            dest_sock.sin_family = AF_INET;
+            dest_sock.sin_port = htons(PORT_BEUIP);
+            dest_sock.sin_addr.s_addr = htonl(table[i].ip);
+            snprintf(msg_out, LBUF, "9BEUIP%s", message);
+            sendto(sid_global, msg_out, strlen(msg_out), 0, (struct sockaddr *)&dest_sock, sizeof(dest_sock));
+        }
+        printf("message envoye a tous.\n");
+    } 
+    else if (octet1 == '0') {
+        /* envoi de l avis de depart a chaque utilisateur de la table */
+        for (i = 0; i < user_count; i++) {
+            bzero(&dest_sock, sizeof(dest_sock));
+            dest_sock.sin_family = AF_INET;
+            dest_sock.sin_port = htons(PORT_BEUIP);
+            dest_sock.sin_addr.s_addr = htonl(table[i].ip);
+            snprintf(msg_out, LBUF, "0BEUIP%s", pseudo_global);
+            sendto(sid_global, msg_out, strlen(msg_out), 0, (struct sockaddr *)&dest_sock, sizeof(dest_sock));
+        }
+    }
+
+    pthread_mutex_unlock(&mutex_table);
+}
+
 /* code du thread serveur udp */
 void * serveur_udp(void * p) {
     int nb_recv, i, j, known;
@@ -48,20 +109,17 @@ void * serveur_udp(void * p) {
         ls = sizeof(sock);
         nb_recv = recvfrom(sid_global, (void*)buf, LBUF, 0, (struct sockaddr *)&sock, &ls);
         
-        /* si recvfrom echoue (socket ferme par le pere lors du stop), on quitte */
         if (nb_recv <= 0) break;
-        
         buf[nb_recv] = '\0';
         
         if (nb_recv >= 6 && strncmp(buf + 1, "BEUIP", 5) == 0) {
             
-            /* securite : le serveur udp ne gere plus les codes de routage interne */
+            /* filtrage strict : blocage des codes internes 3, 4, 5 venant du reseau */
             if (buf[0] != '0' && buf[0] != '1' && buf[0] != '2' && buf[0] != '9') {
                 fprintf(stderr, "\nalerte securite : requete externe refusee (code %c)\n", buf[0]);
                 continue;
             }
 
-            /* section critique : acces a la table partagee */
             pthread_mutex_lock(&mutex_table);
 
             if (buf[0] == '0') {
@@ -134,7 +192,7 @@ char* creer_prompt(void) {
     return prompt;
 }
 
-/* gestion du protocole beuip (start/stop) multi-thread */
+/* gestion du protocole beuip */
 int CommandeBEUIP(int n, char *p[]) {
     struct sockaddr_in sock_conf, bcast_addr;
     char msg_out[LBUF+1];
@@ -157,7 +215,6 @@ int CommandeBEUIP(int n, char *p[]) {
 
         strcpy(pseudo_global, p[2]);
 
-        /* creation du socket dans le thread principal */
         if ((sid_global = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)) < 0) {
             perror("socket"); return 1;
         }
@@ -173,7 +230,6 @@ int CommandeBEUIP(int n, char *p[]) {
 
         setsockopt(sid_global, SOL_SOCKET, SO_BROADCAST, &opt, sizeof(opt));
 
-        /* annonce de depart */
         bzero(&bcast_addr, sizeof(bcast_addr));
         bcast_addr.sin_family = AF_INET;
         bcast_addr.sin_port = htons(PORT_BEUIP);
@@ -182,11 +238,8 @@ int CommandeBEUIP(int n, char *p[]) {
         snprintf(msg_out, LBUF, "1BEUIP%s", pseudo_global);
         sendto(sid_global, msg_out, strlen(msg_out), 0, (struct sockaddr *)&bcast_addr, sizeof(bcast_addr));
 
-        /* creation du thread */
         if (pthread_create(&thread_serveur, NULL, serveur_udp, NULL) != 0) {
-            perror("pthread_create");
-            close(sid_global);
-            return 1;
+            perror("pthread_create"); close(sid_global); return 1;
         }
         
         serveur_actif = 1;
@@ -198,15 +251,9 @@ int CommandeBEUIP(int n, char *p[]) {
             return 1;
         }
 
-        /* envoi de l avis de depart sur le reseau */
-        bzero(&bcast_addr, sizeof(bcast_addr));
-        bcast_addr.sin_family = AF_INET;
-        bcast_addr.sin_port = htons(PORT_BEUIP);
-        bcast_addr.sin_addr.s_addr = inet_addr("192.168.88.255");
-        snprintf(msg_out, LBUF, "0BEUIP%s", pseudo_global);
-        sendto(sid_global, msg_out, strlen(msg_out), 0, (struct sockaddr *)&bcast_addr, sizeof(bcast_addr));
+        /* utilisation de la fonction commande pour envoyer l avis de depart code 0 */
+        commande('0', NULL, NULL);
 
-        /* fermeture du socket pour debloquer le recvfrom du thread */
         close(sid_global);
         pthread_join(thread_serveur, NULL);
         
@@ -220,14 +267,10 @@ int CommandeBEUIP(int n, char *p[]) {
     return 1;
 }
 
-/* commande mess interne (ne passe plus par reseau local) */
+/* commande mess interne simplifiee */
 int CommandeMESS(int n, char *p[]) {
-    int i;
-    struct sockaddr_in dest_sock;
-    char msg_out[LBUF+1];
-
     if (!serveur_actif) {
-        fprintf(stderr, "erreur : demarrez d abord le reseau (beuip start pseudo)\n");
+        fprintf(stderr, "erreur : demarrez d abord le reseau\n");
         return 1;
     }
 
@@ -236,51 +279,21 @@ int CommandeMESS(int n, char *p[]) {
         return 1;
     }
 
-    pthread_mutex_lock(&mutex_table);
-
-    /* cas 1 : liste */
+    /* aiguillage vers la fonction de commande unifiee */
     if (strcmp(p[1], "list") == 0) {
-        printf("--- table des presents (%d) ---\n", user_count);
-        for (i = 0; i < user_count; i++) {
-            printf("%s : %s\n", table[i].pseudo, addrip(table[i].ip));
-        }
+        commande('3', NULL, NULL);
     } 
-    /* cas 2 : a tous */
     else if (strcmp(p[1], "all") == 0 && n >= 3) {
-        for (i = 0; i < user_count; i++) {
-            bzero(&dest_sock, sizeof(dest_sock));
-            dest_sock.sin_family = AF_INET;
-            dest_sock.sin_port = htons(PORT_BEUIP);
-            dest_sock.sin_addr.s_addr = htonl(table[i].ip);
-            snprintf(msg_out, LBUF, "9BEUIP%s", p[2]);
-            sendto(sid_global, msg_out, strlen(msg_out), 0, (struct sockaddr *)&dest_sock, sizeof(dest_sock));
-        }
-        printf("message envoye a tous.\n");
-    }
-    /* cas 3 : prive */
+        commande('5', p[2], NULL);
+    } 
     else if (n >= 3) {
-        int found = 0;
-        for (i = 0; i < user_count; i++) {
-            if (strcmp(table[i].pseudo, p[1]) == 0) {
-                bzero(&dest_sock, sizeof(dest_sock));
-                dest_sock.sin_family = AF_INET;
-                dest_sock.sin_port = htons(PORT_BEUIP);
-                dest_sock.sin_addr.s_addr = htonl(table[i].ip);
-                snprintf(msg_out, LBUF, "9BEUIP%s", p[2]);
-                sendto(sid_global, msg_out, strlen(msg_out), 0, (struct sockaddr *)&dest_sock, sizeof(dest_sock));
-                found = 1;
-                printf("message envoye a %s.\n", p[1]);
-                break;
-            }
-        }
-        if (!found) printf("erreur : pseudo %s inconnu.\n", p[1]);
+        commande('4', p[2], p[1]);
     }
 
-    pthread_mutex_unlock(&mutex_table);
     return 1;
 }
 
-/* gestion de la sortie de biceps */
+/* gestion de la sortie */
 int Sortie(int n, char *p[]) {
     write_history(HIST_FILE);
     if (serveur_actif) {
@@ -292,10 +305,27 @@ int Sortie(int n, char *p[]) {
     return 0;
 }
 
-/* autres commandes ... */
-int CommandeCD(int n, char *p[]) { /* ... (comme avant) ... */ return 1; }
-int CommandePWD(int n, char *p[]) { /* ... (comme avant) ... */ return 1; }
-int CommandeVERS(int n, char *p[]) { printf("biceps version 3.0 - multithread\n"); return 1; }
+int CommandeCD(int n, char *p[]) {
+    if (n < 2) {
+        char *home = getenv("HOME");
+        if (home) chdir(home);
+    } else {
+        if (chdir(p[1]) != 0) perror("cd");
+    }
+    return 1;
+}
+
+int CommandePWD(int n, char *p[]) {
+    char cwd[1024];
+    if (getcwd(cwd, sizeof(cwd)) != NULL) printf("%s\n", cwd);
+    else perror("pwd");
+    return 1;
+}
+
+int CommandeVERS(int n, char *p[]) {
+    printf("biceps version 3.0 - multithread\n");
+    return 1;
+}
 
 void majComInt(void) {
     ajouteCom("exit", Sortie);
