@@ -11,6 +11,7 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <sys/stat.h>
 #include "gescom.h"
 #include "creme.h"
 
@@ -41,24 +42,29 @@ char * addrip(unsigned long a) {
     return b;
 }
 
-/* fonction centralisee pour les commandes internes non securisees */
+/* fonction utilitaire pour creer un repertoire s il n existe pas */
+void verifier_repertoire(const char *chemin) {
+    struct stat st = {0};
+    if (stat(chemin, &st) == -1) {
+        mkdir(chemin, 0700);
+    }
+}
+
+/* fonction centralisee pour les commandes internes */
 void commande(char octet1, char *message, char *pseudo) {
     int i;
     struct sockaddr_in dest_sock;
     char msg_out[LBUF+1];
 
-    /* protection de la lecture de la table */
     pthread_mutex_lock(&mutex_table);
 
     if (octet1 == '3') {
-        /* affichage de la liste */
         printf("--- table des presents (%d) ---\n", user_count);
         for (i = 0; i < user_count; i++) {
             printf("%s : %s\n", table[i].pseudo, addrip(table[i].ip));
         }
     } 
     else if (octet1 == '4') {
-        /* gestion des homonymes et message a un pseudo/ip */
         int nb_matches = 0;
         int last_match_index = -1;
         
@@ -97,7 +103,6 @@ void commande(char octet1, char *message, char *pseudo) {
         }
     } 
     else if (octet1 == '5') {
-        /* message a tous */
         for (i = 0; i < user_count; i++) {
             bzero(&dest_sock, sizeof(dest_sock));
             dest_sock.sin_family = AF_INET;
@@ -109,7 +114,6 @@ void commande(char octet1, char *message, char *pseudo) {
         printf("message envoye a tous.\n");
     } 
     else if (octet1 == '0') {
-        /* envoi de l avis de depart */
         for (i = 0; i < user_count; i++) {
             bzero(&dest_sock, sizeof(dest_sock));
             dest_sock.sin_family = AF_INET;
@@ -131,6 +135,7 @@ void * serveur_udp(void * p) {
     char buf[LBUF+1], msg_out[LBUF+1];
     unsigned long sender_ip;
     char sender_pseudo[LBUF];
+    char chemin_user[256];
 
     for (;;) {
         ls = sizeof(sock);
@@ -141,7 +146,6 @@ void * serveur_udp(void * p) {
         
         if (nb_recv >= 6 && strncmp(buf + 1, "BEUIP", 5) == 0) {
             
-            /* filtrage strict */
             if (buf[0] != '0' && buf[0] != '1' && buf[0] != '2' && buf[0] != '9') {
                 fprintf(stderr, "\nalerte securite : requete externe refusee (code %c)\n", buf[0]);
                 continue;
@@ -175,7 +179,6 @@ void * serveur_udp(void * p) {
                 }
                 if (!known) strcpy(pseudo_exp, addrip(sender_ip));
 
-                /* stockage securise dans la boite de reception au lieu d un affichage immediat */
                 pthread_mutex_lock(&mutex_msg);
                 if (nb_msg_attente < MAX_MSGS) {
                     snprintf(boite_reception[nb_msg_attente], LBUF, "message de %s : %s", pseudo_exp, buf + 6);
@@ -196,6 +199,11 @@ void * serveur_udp(void * p) {
                     table[user_count].ip = sender_ip;
                     strcpy(table[user_count].pseudo, sender_pseudo);
                     user_count++;
+                    
+                    /* ETAPE 2.2 : creation du sous-repertoire pour cet utilisateur specifique */
+                    snprintf(chemin_user, sizeof(chemin_user), "reppub/%s", addrip(sender_ip));
+                    verifier_repertoire(chemin_user);
+
 #ifdef TRACE
                     printf("\nnouveau contact : %s (%s)\n", sender_pseudo, addrip(sender_ip));
 #endif
@@ -211,7 +219,6 @@ void * serveur_udp(void * p) {
     return NULL;
 }
 
-/* generation du texte du prompt */
 char* creer_prompt(void) {
     char* user = getenv("USER");
     char hostname[256];
@@ -229,7 +236,6 @@ char* creer_prompt(void) {
     return prompt;
 }
 
-/* gestion du protocole beuip */
 int CommandeBEUIP(int n, char *p[]) {
     struct sockaddr_in sock_conf, bcast_addr;
     char msg_out[LBUF+1];
@@ -251,6 +257,9 @@ int CommandeBEUIP(int n, char *p[]) {
         }
 
         strcpy(pseudo_global, p[2]);
+
+        /* ETAPE 2.2 : initialisation du repertoire racine de partage */
+        verifier_repertoire("reppub");
 
         if ((sid_global = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)) < 0) {
             perror("socket"); return 1;
@@ -303,32 +312,23 @@ int CommandeBEUIP(int n, char *p[]) {
     return 1;
 }
 
-/* commande mess interne simplifiee */
 int CommandeMESS(int n, char *p[]) {
     if (!serveur_actif) {
         fprintf(stderr, "erreur : demarrez d abord le reseau\n");
         return 1;
     }
-
     if (n < 2) {
         fprintf(stderr, "usage : mess list | mess all <msg> | mess <pseudo> <msg>\n");
         return 1;
     }
 
-    if (strcmp(p[1], "list") == 0) {
-        commande('3', NULL, NULL);
-    } 
-    else if (strcmp(p[1], "all") == 0 && n >= 3) {
-        commande('5', p[2], NULL);
-    } 
-    else if (n >= 3) {
-        commande('4', p[2], p[1]);
-    }
+    if (strcmp(p[1], "list") == 0) commande('3', NULL, NULL);
+    else if (strcmp(p[1], "all") == 0 && n >= 3) commande('5', p[2], NULL);
+    else if (n >= 3) commande('4', p[2], p[1]);
 
     return 1;
 }
 
-/* gestion de la sortie */
 int Sortie(int n, char *p[]) {
     write_history(HIST_FILE);
     if (serveur_actif) {
@@ -358,7 +358,7 @@ int CommandePWD(int n, char *p[]) {
 }
 
 int CommandeVERS(int n, char *p[]) {
-    printf("biceps version 3.0 - multithread\n");
+    printf("biceps version 3.0 - fichiers\n");
     return 1;
 }
 
@@ -381,7 +381,6 @@ int main(int argc, char *argv[]) {
     majComInt();
 
     while (1) {
-        /* vidage securise de la boite de reception avant de generer le prompt */
         pthread_mutex_lock(&mutex_msg);
         if (nb_msg_attente > 0) {
             printf("\n--- %d message(s) en attente ---\n", nb_msg_attente);
