@@ -16,11 +16,17 @@
 
 #define HIST_FILE ".biceps_history"
 #define MAX_USERS 255
+#define MAX_MSGS 50
 
 /* variables globales partagees */
 struct user_info table[MAX_USERS];
 int user_count = 0;
 pthread_mutex_t mutex_table = PTHREAD_MUTEX_INITIALIZER;
+
+/* variables pour la boite de reception */
+char boite_reception[MAX_MSGS][LBUF+1];
+int nb_msg_attente = 0;
+pthread_mutex_t mutex_msg = PTHREAD_MUTEX_INITIALIZER;
 
 pthread_t thread_serveur;
 int serveur_actif = 0;
@@ -35,9 +41,9 @@ char * addrip(unsigned long a) {
     return b;
 }
 
-/* fonction centralisee pour les commandes internes non securisees (etape 1.2) */
+/* fonction centralisee pour les commandes internes non securisees */
 void commande(char octet1, char *message, char *pseudo) {
-    int i, found;
+    int i;
     struct sockaddr_in dest_sock;
     char msg_out[LBUF+1];
 
@@ -52,25 +58,46 @@ void commande(char octet1, char *message, char *pseudo) {
         }
     } 
     else if (octet1 == '4') {
-        /* message a un pseudo (envoi code 9) */
-        found = 0;
+        /* gestion des homonymes et message a un pseudo/ip */
+        int nb_matches = 0;
+        int last_match_index = -1;
+        
         for (i = 0; i < user_count; i++) {
-            if (strcmp(table[i].pseudo, pseudo) == 0) {
-                bzero(&dest_sock, sizeof(dest_sock));
-                dest_sock.sin_family = AF_INET;
-                dest_sock.sin_port = htons(PORT_BEUIP);
-                dest_sock.sin_addr.s_addr = htonl(table[i].ip);
-                snprintf(msg_out, LBUF, "9BEUIP%s", message);
-                sendto(sid_global, msg_out, strlen(msg_out), 0, (struct sockaddr *)&dest_sock, sizeof(dest_sock));
-                found = 1;
-                printf("message envoye a %s.\n", pseudo);
+            if (strcmp(addrip(table[i].ip), pseudo) == 0) {
+                last_match_index = i;
+                nb_matches = 1;
                 break;
+            } 
+            else if (strcmp(table[i].pseudo, pseudo) == 0) {
+                last_match_index = i;
+                nb_matches++;
             }
         }
-        if (!found) printf("erreur : pseudo %s inconnu.\n", pseudo);
+
+        if (nb_matches == 1) {
+            bzero(&dest_sock, sizeof(dest_sock));
+            dest_sock.sin_family = AF_INET;
+            dest_sock.sin_port = htons(PORT_BEUIP);
+            dest_sock.sin_addr.s_addr = htonl(table[last_match_index].ip);
+            snprintf(msg_out, LBUF, "9BEUIP%s", message);
+            sendto(sid_global, msg_out, strlen(msg_out), 0, (struct sockaddr *)&dest_sock, sizeof(dest_sock));
+            printf("message envoye a %s (%s).\n", table[last_match_index].pseudo, addrip(table[last_match_index].ip));
+        } 
+        else if (nb_matches > 1) {
+            printf("erreur : %d utilisateurs ont le pseudo '%s'.\n", nb_matches, pseudo);
+            printf("veuillez preciser l adresse ip pour envoyer votre message :\n");
+            for (i = 0; i < user_count; i++) {
+                if (strcmp(table[i].pseudo, pseudo) == 0) {
+                    printf("- mess %s %s\n", addrip(table[i].ip), message);
+                }
+            }
+        } 
+        else {
+            printf("erreur : cible '%s' inconnue.\n", pseudo);
+        }
     } 
     else if (octet1 == '5') {
-        /* message a tous (envoi code 9 individuel) */
+        /* message a tous */
         for (i = 0; i < user_count; i++) {
             bzero(&dest_sock, sizeof(dest_sock));
             dest_sock.sin_family = AF_INET;
@@ -82,7 +109,7 @@ void commande(char octet1, char *message, char *pseudo) {
         printf("message envoye a tous.\n");
     } 
     else if (octet1 == '0') {
-        /* envoi de l avis de depart a chaque utilisateur de la table */
+        /* envoi de l avis de depart */
         for (i = 0; i < user_count; i++) {
             bzero(&dest_sock, sizeof(dest_sock));
             dest_sock.sin_family = AF_INET;
@@ -114,7 +141,7 @@ void * serveur_udp(void * p) {
         
         if (nb_recv >= 6 && strncmp(buf + 1, "BEUIP", 5) == 0) {
             
-            /* filtrage strict : blocage des codes internes 3, 4, 5 venant du reseau */
+            /* filtrage strict */
             if (buf[0] != '0' && buf[0] != '1' && buf[0] != '2' && buf[0] != '9') {
                 fprintf(stderr, "\nalerte securite : requete externe refusee (code %c)\n", buf[0]);
                 continue;
@@ -138,13 +165,23 @@ void * serveur_udp(void * p) {
             else if (buf[0] == '9') {
                 sender_ip = ntohl(sock.sin_addr.s_addr);
                 known = 0;
+                char pseudo_exp[LBUF] = "inconnu";
+                
                 for (i = 0; i < user_count; i++) {
                     if (table[i].ip == sender_ip) {
-                        printf("\nmessage de %s : %s\n", table[i].pseudo, buf + 6);
+                        strcpy(pseudo_exp, table[i].pseudo);
                         known = 1; break;
                     }
                 }
-                if (!known) printf("\nmessage de %s (inconnu) : %s\n", addrip(sender_ip), buf + 6);
+                if (!known) strcpy(pseudo_exp, addrip(sender_ip));
+
+                /* stockage securise dans la boite de reception au lieu d un affichage immediat */
+                pthread_mutex_lock(&mutex_msg);
+                if (nb_msg_attente < MAX_MSGS) {
+                    snprintf(boite_reception[nb_msg_attente], LBUF, "message de %s : %s", pseudo_exp, buf + 6);
+                    nb_msg_attente++;
+                }
+                pthread_mutex_unlock(&mutex_msg);
             }
             else if (buf[0] == '1' || buf[0] == '2') {
                 sender_ip = ntohl(sock.sin_addr.s_addr);
@@ -251,7 +288,6 @@ int CommandeBEUIP(int n, char *p[]) {
             return 1;
         }
 
-        /* utilisation de la fonction commande pour envoyer l avis de depart code 0 */
         commande('0', NULL, NULL);
 
         close(sid_global);
@@ -279,7 +315,6 @@ int CommandeMESS(int n, char *p[]) {
         return 1;
     }
 
-    /* aiguillage vers la fonction de commande unifiee */
     if (strcmp(p[1], "list") == 0) {
         commande('3', NULL, NULL);
     } 
@@ -340,12 +375,24 @@ int main(int argc, char *argv[]) {
     char *ligne;
     char *prompt;
     char *commande_isolee;
-    int i;
+    int i, k;
 
     read_history(HIST_FILE);
     majComInt();
 
     while (1) {
+        /* vidage securise de la boite de reception avant de generer le prompt */
+        pthread_mutex_lock(&mutex_msg);
+        if (nb_msg_attente > 0) {
+            printf("\n--- %d message(s) en attente ---\n", nb_msg_attente);
+            for (k = 0; k < nb_msg_attente; k++) {
+                printf("> %s\n", boite_reception[k]);
+            }
+            printf("--------------------------------\n");
+            nb_msg_attente = 0;
+        }
+        pthread_mutex_unlock(&mutex_msg);
+
         prompt = creer_prompt();
         ligne = readline(prompt);
         free(prompt);
