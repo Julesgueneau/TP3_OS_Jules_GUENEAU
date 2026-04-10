@@ -12,7 +12,7 @@ L'application est conçue autour d'une architecture multi-thread robuste et resp
 - **Gestion de la mémoire :** La table des contacts est gérée via une liste chaînée allouée dynamiquement (`struct user_node`). À l'arrêt du programme, l'intégralité de la mémoire allouée est libérée (`free_user_list`, `clear_history`) pour garantir une exécution sans aucune fuite sous Valgrind.
 - **Interface non bloquante :** L'affichage des messages réseau entrants est différé grâce à une boîte de réception protégée par mutex (`PTHREAD_MUTEX_INITIALIZER`). Cela empêche l'interruption visuelle du prompt lors de la frappe d'une commande.
 
-## Fonctionnalités Implémentées (Conformité 100%)
+## Fonctionnalités Implémentées 
 - **Cycle de vie :** `beuip start <pseudo>` (initialise les serveurs et broadcast la présence) et `beuip stop` (envoie l'avis de départ et ferme proprement les threads).
 - **Annuaire :** `beuip list` affiche la liste exacte des utilisateurs présents.
 - **Messagerie (UDP) :** - `beuip message <pseudo> <msg>` : Envoi unicast avec concaténation automatique des chaînes à espaces.
