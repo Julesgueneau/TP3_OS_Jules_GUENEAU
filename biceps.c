@@ -16,25 +16,37 @@
 #include "creme.h"
 
 #define HIST_FILE ".biceps_history"
-#define MAX_USERS 255
 #define MAX_MSGS 50
+#define BCAST_IP "192.168.88.255"
+#define PORT_TCP 9998
 
-/* variables globales partagees */
-struct user_info table[MAX_USERS];
-int user_count = 0;
+/* definition de la structure de liste chainee (conformite tp3 prof) */
+struct user_node {
+    unsigned long ip;
+    char pseudo[LBUF];
+    struct user_node *next;
+};
+
+/* variables globales synchronisees */
+struct user_node *user_list = NULL;
 pthread_mutex_t mutex_table = PTHREAD_MUTEX_INITIALIZER;
 
-/* variables pour la boite de reception */
 char boite_reception[MAX_MSGS][LBUF+1];
 int nb_msg_attente = 0;
 pthread_mutex_t mutex_msg = PTHREAD_MUTEX_INITIALIZER;
 
-pthread_t thread_serveur;
+pthread_t thread_serveur_udp;
+pthread_t thread_serveur_tcp;
 int serveur_actif = 0;
-int sid_global = -1;
+int sid_udp = -1;
+int sid_tcp = -1;
 char pseudo_global[LBUF];
 
-/* utilitaire de conversion ip */
+/* prototypes */
+void * serveur_udp(void * p);
+void * serveur_tcp(void * p);
+
+/* fonctions utilitaires reseau et fichiers */
 char * addrip(unsigned long a) {
     static char b[16];
     sprintf(b,"%u.%u.%u.%u", (unsigned int)(a>>24&0xFF), (unsigned int)(a>>16&0xFF),
@@ -42,154 +54,336 @@ char * addrip(unsigned long a) {
     return b;
 }
 
-/* fonction utilitaire pour creer un repertoire */
 void verifier_repertoire(const char *chemin) {
     struct stat st = {0};
-    if (stat(chemin, &st) == -1) {
-        mkdir(chemin, 0700);
+    if (stat(chemin, &st) == -1) mkdir(chemin, 0700);
+}
+
+/* fonctions de gestion de la liste chainee memoire */
+void add_user(unsigned long ip, const char *pseudo) {
+    struct user_node *new_node = malloc(sizeof(struct user_node));
+    if (!new_node) return;
+    new_node->ip = ip;
+    strncpy(new_node->pseudo, pseudo, LBUF-1);
+    new_node->pseudo[LBUF-1] = '\0';
+    new_node->next = user_list;
+    user_list = new_node;
+}
+
+void remove_user(unsigned long ip) {
+    struct user_node *curr = user_list, *prev = NULL;
+    while (curr) {
+        if (curr->ip == ip) {
+            if (prev) prev->next = curr->next;
+            else user_list = curr->next;
+            free(curr);
+            return;
+        }
+        prev = curr;
+        curr = curr->next;
     }
 }
 
-/* fonction centralisee pour les commandes internes */
-void commande(char octet1, char *message, char *pseudo) {
-    int i;
-    struct sockaddr_in dest_sock;
-    char msg_out[LBUF+1];
+void free_user_list(void) {
+    struct user_node *curr = user_list, *tmp;
+    while (curr) {
+        tmp = curr;
+        curr = curr->next;
+        free(tmp);
+    }
+    user_list = NULL;
+}
 
+unsigned long find_ip_by_pseudo(const char *pseudo) {
+    struct user_node *curr;
+    unsigned long ip = 0;
     pthread_mutex_lock(&mutex_table);
-
-    if (octet1 == '3') {
-        printf("--- table des presents (%d) ---\n", user_count);
-        for (i = 0; i < user_count; i++) {
-            printf("%s : %s\n", table[i].pseudo, addrip(table[i].ip));
-        }
-    } 
-    else if (octet1 == '4') {
-        int nb_matches = 0;
-        int last_match_index = -1;
-        
-        for (i = 0; i < user_count; i++) {
-            if (strcmp(addrip(table[i].ip), pseudo) == 0) {
-                last_match_index = i;
-                nb_matches = 1;
-                break;
-            } 
-            else if (strcmp(table[i].pseudo, pseudo) == 0) {
-                last_match_index = i;
-                nb_matches++;
-            }
-        }
-
-        if (nb_matches == 1) {
-            bzero(&dest_sock, sizeof(dest_sock));
-            dest_sock.sin_family = AF_INET;
-            dest_sock.sin_port = htons(PORT_BEUIP);
-            dest_sock.sin_addr.s_addr = htonl(table[last_match_index].ip);
-            snprintf(msg_out, LBUF, "9BEUIP%s", message);
-            sendto(sid_global, msg_out, strlen(msg_out), 0, (struct sockaddr *)&dest_sock, sizeof(dest_sock));
-            printf("message envoye a %s (%s).\n", table[last_match_index].pseudo, addrip(table[last_match_index].ip));
-        } 
-        else if (nb_matches > 1) {
-            printf("erreur : %d utilisateurs ont le pseudo '%s'.\n", nb_matches, pseudo);
-            printf("veuillez preciser l adresse ip pour envoyer votre message :\n");
-            for (i = 0; i < user_count; i++) {
-                if (strcmp(table[i].pseudo, pseudo) == 0) {
-                    printf("- mess %s %s\n", addrip(table[i].ip), message);
-                }
-            }
-        } 
-        else {
-            printf("erreur : cible '%s' inconnue.\n", pseudo);
-        }
-    } 
-    else if (octet1 == '5') {
-        for (i = 0; i < user_count; i++) {
-            bzero(&dest_sock, sizeof(dest_sock));
-            dest_sock.sin_family = AF_INET;
-            dest_sock.sin_port = htons(PORT_BEUIP);
-            dest_sock.sin_addr.s_addr = htonl(table[i].ip);
-            snprintf(msg_out, LBUF, "9BEUIP%s", message);
-            sendto(sid_global, msg_out, strlen(msg_out), 0, (struct sockaddr *)&dest_sock, sizeof(dest_sock));
-        }
-        printf("message envoye a tous.\n");
+    for (curr = user_list; curr != NULL; curr = curr->next) {
+        if (strcmp(curr->pseudo, pseudo) == 0) { ip = curr->ip; break; }
     }
-    else if (octet1 == '6') {
-        /* diffusion de la requete de fichier a tous les contacts (code 6) */
-        for (i = 0; i < user_count; i++) {
-            bzero(&dest_sock, sizeof(dest_sock));
-            dest_sock.sin_family = AF_INET;
-            dest_sock.sin_port = htons(PORT_BEUIP);
-            dest_sock.sin_addr.s_addr = htonl(table[i].ip);
-            snprintf(msg_out, LBUF, "6BEUIP%s", message);
-            sendto(sid_global, msg_out, strlen(msg_out), 0, (struct sockaddr *)&dest_sock, sizeof(dest_sock));
-        }
-        printf("requete de recherche pour '%s' envoyee au reseau.\n", message);
-    }
-    else if (octet1 == '0') {
-        for (i = 0; i < user_count; i++) {
-            bzero(&dest_sock, sizeof(dest_sock));
-            dest_sock.sin_family = AF_INET;
-            dest_sock.sin_port = htons(PORT_BEUIP);
-            dest_sock.sin_addr.s_addr = htonl(table[i].ip);
-            snprintf(msg_out, LBUF, "0BEUIP%s", pseudo_global);
-            sendto(sid_global, msg_out, strlen(msg_out), 0, (struct sockaddr *)&dest_sock, sizeof(dest_sock));
-        }
-    }
+    pthread_mutex_unlock(&mutex_table);
+    return ip;
+}
 
+/* commandes de base beuip */
+void beuip_list(void) {
+    struct user_node *curr;
+    pthread_mutex_lock(&mutex_table);
+    for (curr = user_list; curr != NULL; curr = curr->next) {
+        printf("%s : %s\n", addrip(curr->ip), curr->pseudo);
+    }
     pthread_mutex_unlock(&mutex_table);
 }
 
-/* code du thread serveur udp */
+void beuip_message(int n, char *p[]) {
+    char msg[LBUF] = "";
+    struct user_node *curr;
+    struct sockaddr_in dest;
+    char msg_out[LBUF+1];
+    int i;
+    
+    for (i = 3; i < n; i++) {
+        strncat(msg, p[i], LBUF - strlen(msg) - 1);
+        if (i < n - 1) strncat(msg, " ", LBUF - strlen(msg) - 1);
+    }
+
+    pthread_mutex_lock(&mutex_table);
+    for (curr = user_list; curr != NULL; curr = curr->next) {
+        if (strcmp(p[2], "all") == 0 || strcmp(curr->pseudo, p[2]) == 0) {
+            memset(&dest, 0, sizeof(dest));
+            dest.sin_family = AF_INET;
+            dest.sin_port = htons(PORT_BEUIP);
+            dest.sin_addr.s_addr = htonl(curr->ip);
+            snprintf(msg_out, LBUF, "9BEUIP%s", msg);
+            sendto(sid_udp, msg_out, strlen(msg_out), 0, (struct sockaddr *)&dest, sizeof(dest));
+            if (strcmp(p[2], "all") != 0) break;
+        }
+    }
+    pthread_mutex_unlock(&mutex_table);
+}
+
+/* section 3.2 : recuperation de la liste du repertoire via tcp */
+void demandeListe(char *pseudo) {
+    unsigned long ip = find_ip_by_pseudo(pseudo);
+    if (!ip) { printf("erreur : pseudo %s introuvable.\n", pseudo); return; }
+
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in sin;
+    memset(&sin, 0, sizeof(sin));
+    sin.sin_family = AF_INET;
+    sin.sin_port = htons(PORT_TCP);
+    sin.sin_addr.s_addr = htonl(ip);
+
+    if (connect(sock, (struct sockaddr*)&sin, sizeof(sin)) == 0) {
+        write(sock, "L", 1);
+        char buffer[1024];
+        int n;
+        printf("--- fichiers de %s ---\n", pseudo);
+        while ((n = read(sock, buffer, sizeof(buffer)-1)) > 0) {
+            buffer[n] = '\0';
+            printf("%s", buffer);
+        }
+        printf("----------------------\n");
+    } else {
+        perror("connect");
+    }
+    close(sock);
+}
+
+/* section 3.3 : telechargement de fichier via tcp */
+void demandeFichier(char *pseudo, char *nomfic) {
+    char savepath[512];
+    snprintf(savepath, sizeof(savepath), "reppub/%s", nomfic);
+    if (access(savepath, F_OK) == 0) {
+        printf("erreur : le fichier %s existe deja localement.\n", nomfic);
+        return;
+    }
+
+    unsigned long ip = find_ip_by_pseudo(pseudo);
+    if (!ip) { printf("erreur : pseudo %s introuvable.\n", pseudo); return; }
+
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in sin;
+    memset(&sin, 0, sizeof(sin));
+    sin.sin_family = AF_INET;
+    sin.sin_port = htons(PORT_TCP);
+    sin.sin_addr.s_addr = htonl(ip);
+
+    if (connect(sock, (struct sockaddr*)&sin, sizeof(sin)) == 0) {
+        char req[512];
+        int req_len = snprintf(req, sizeof(req), "F%s\n", nomfic);
+        write(sock, req, req_len);
+
+        FILE *out = fopen(savepath, "wb");
+        if (out) {
+            char buffer[1024];
+            int n;
+            int total = 0;
+            while ((n = read(sock, buffer, sizeof(buffer))) > 0) {
+                fwrite(buffer, 1, n, out);
+                total += n;
+            }
+            fclose(out);
+            if (total > 0) printf("fichier %s telecharge avec succes (%d octets).\n", nomfic, total);
+            else { printf("erreur : le fichier %s est introuvable ou vide sur le serveur distant.\n", nomfic); remove(savepath); }
+        }
+    } else {
+        perror("connect");
+    }
+    close(sock);
+}
+
+/* cycle de vie des serveurs */
+int beuip_start(char *pseudo) {
+    struct sockaddr_in sock_conf, bcast_addr;
+    char msg_out[LBUF+1];
+    int opt = 1;
+
+    if (serveur_actif) return 1;
+    strncpy(pseudo_global, pseudo, LBUF-1);
+    pseudo_global[LBUF-1] = '\0';
+    verifier_repertoire("reppub");
+
+    /* initialisation udp */
+    if ((sid_udp = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)) < 0) return 1;
+    memset(&sock_conf, 0, sizeof(sock_conf));
+    sock_conf.sin_family = AF_INET;
+    sock_conf.sin_port = htons(PORT_BEUIP);
+    sock_conf.sin_addr.s_addr = htonl(INADDR_ANY);
+    if (bind(sid_udp, (struct sockaddr *)&sock_conf, sizeof(sock_conf)) == -1) return 1;
+    setsockopt(sid_udp, SOL_SOCKET, SO_BROADCAST, &opt, sizeof(opt));
+
+    /* annonce de presence sur le broadcast */
+    memset(&bcast_addr, 0, sizeof(bcast_addr));
+    bcast_addr.sin_family = AF_INET;
+    bcast_addr.sin_port = htons(PORT_BEUIP);
+    bcast_addr.sin_addr.s_addr = inet_addr(BCAST_IP);
+    snprintf(msg_out, LBUF, "1BEUIP%s", pseudo_global);
+    sendto(sid_udp, msg_out, strlen(msg_out), 0, (struct sockaddr *)&bcast_addr, sizeof(bcast_addr));
+
+    /* lancement des deux threads serveurs */
+    serveur_actif = 1;
+    pthread_create(&thread_serveur_udp, NULL, serveur_udp, NULL);
+    pthread_create(&thread_serveur_tcp, NULL, serveur_tcp, NULL);
+    return 1;
+}
+
+int beuip_stop(void) {
+    struct sockaddr_in dest;
+    char msg_out[LBUF+1];
+    struct user_node *curr;
+
+    if (!serveur_actif) return 1;
+    serveur_actif = 0; /* signale aux threads de s arreter */
+
+    /* depart propre via unicast udp */
+    pthread_mutex_lock(&mutex_table);
+    for (curr = user_list; curr != NULL; curr = curr->next) {
+        memset(&dest, 0, sizeof(dest));
+        dest.sin_family = AF_INET;
+        dest.sin_port = htons(PORT_BEUIP);
+        dest.sin_addr.s_addr = htonl(curr->ip);
+        snprintf(msg_out, LBUF, "0BEUIP%s", pseudo_global);
+        sendto(sid_udp, msg_out, strlen(msg_out), 0, (struct sockaddr *)&dest, sizeof(dest));
+    }
+    free_user_list();
+    pthread_mutex_unlock(&mutex_table);
+
+    close(sid_udp);
+    
+    /* connexion factice pour debloquer le accept du serveur tcp */
+    int dummy = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in sin;
+    memset(&sin, 0, sizeof(sin));
+    sin.sin_family = AF_INET;
+    sin.sin_port = htons(PORT_TCP);
+    sin.sin_addr.s_addr = inet_addr("127.0.0.1");
+    connect(dummy, (struct sockaddr*)&sin, sizeof(sin));
+    close(dummy);
+
+    pthread_join(thread_serveur_udp, NULL);
+    pthread_join(thread_serveur_tcp, NULL);
+    return 1;
+}
+
+/* routeur de commandes */
+int CommandeBEUIP(int n, char *p[]) {
+    if (n < 2) return 1;
+    if (strcmp(p[1], "start") == 0 && n >= 3) return beuip_start(p[2]);
+    if (strcmp(p[1], "stop") == 0) return beuip_stop();
+    if (strcmp(p[1], "list") == 0) { beuip_list(); return 1; }
+    if (strcmp(p[1], "message") == 0 && n >= 4) { beuip_message(n, p); return 1; }
+    if (strcmp(p[1], "ls") == 0 && n >= 3) { demandeListe(p[2]); return 1; }
+    if (strcmp(p[1], "get") == 0 && n >= 4) { demandeFichier(p[2], p[3]); return 1; }
+    return 1;
+}
+
+/* logique d expediteur tcp appelee par le thread tcp (sections 3.2 et 3.3) */
+void envoiContenu(int fd) {
+    char cmd;
+    if (read(fd, &cmd, 1) <= 0) return;
+
+    if (cmd == 'L') {
+        if (fork() == 0) {
+            dup2(fd, 1); dup2(fd, 2); close(fd);
+            execlp("ls", "ls", "-l", "reppub/", NULL);
+            exit(1);
+        }
+        wait(NULL); /* evite les processus zombies */
+    } 
+    else if (cmd == 'F') {
+        char nomfic[256];
+        int i = 0;
+        while (read(fd, &nomfic[i], 1) > 0 && nomfic[i] != '\n' && i < 255) i++;
+        nomfic[i] = '\0';
+        if (fork() == 0) {
+            dup2(fd, 1); dup2(fd, 2); close(fd);
+            char path[512];
+            snprintf(path, sizeof(path), "reppub/%s", nomfic);
+            execlp("cat", "cat", path, NULL);
+            exit(1);
+        }
+        wait(NULL);
+    }
+}
+
+/* thread tcp sur le port 9998 (section 3.1) */
+void * serveur_tcp(void * p) {
+    int fd;
+    struct sockaddr_in sin;
+    int opt = 1;
+
+    if ((sid_tcp = socket(AF_INET, SOCK_STREAM, 0)) < 0) return NULL;
+    setsockopt(sid_tcp, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    
+    memset(&sin, 0, sizeof(sin));
+    sin.sin_family = AF_INET;
+    sin.sin_port = htons(PORT_TCP);
+    sin.sin_addr.s_addr = htonl(INADDR_ANY);
+    
+    if (bind(sid_tcp, (struct sockaddr*)&sin, sizeof(sin)) == -1) { close(sid_tcp); return NULL; }
+    listen(sid_tcp, 5);
+
+    while (serveur_actif) {
+        fd = accept(sid_tcp, NULL, NULL);
+        if (fd >= 0) {
+            if (serveur_actif) envoiContenu(fd);
+            close(fd);
+        }
+    }
+    close(sid_tcp);
+    return NULL;
+}
+
+/* thread udp pour l intercommunication beuip */
 void * serveur_udp(void * p) {
-    int nb_recv, i, j, known;
+    int nb_recv;
     struct sockaddr_in sock;
     socklen_t ls;
     char buf[LBUF+1], msg_out[LBUF+1];
     unsigned long sender_ip;
-    char sender_pseudo[LBUF];
-    char chemin_user[256];
 
     for (;;) {
         ls = sizeof(sock);
-        nb_recv = recvfrom(sid_global, (void*)buf, LBUF, 0, (struct sockaddr *)&sock, &ls);
-        
+        nb_recv = recvfrom(sid_udp, (void*)buf, LBUF, 0, (struct sockaddr *)&sock, &ls);
         if (nb_recv <= 0) break;
         
-        /* on ne met pas de caractere de fin de chaine globalement car un fichier (code 7) peut contenir des octets nuls */
         if (nb_recv >= 6 && strncmp(buf + 1, "BEUIP", 5) == 0) {
+            if (buf[0] != '0' && buf[0] != '1' && buf[0] != '2' && buf[0] != '9') continue;
             
-            /* autorisation des nouveaux codes applicatifs 6 et 7 */
-            if (buf[0] != '0' && buf[0] != '1' && buf[0] != '2' && buf[0] != '9' && buf[0] != '6' && buf[0] != '7') {
-                continue;
-            }
-
             pthread_mutex_lock(&mutex_table);
-
+            sender_ip = ntohl(sock.sin_addr.s_addr);
+            
             if (buf[0] == '0') {
-                buf[nb_recv] = '\0';
-                sender_ip = ntohl(sock.sin_addr.s_addr);
-                for (i = 0; i < user_count; i++) {
-                    if (table[i].ip == sender_ip) {
-                        for (j = i; j < user_count - 1; j++) table[j] = table[j+1];
-                        user_count--;
-                        break;
-                    }
-                }
+                remove_user(sender_ip);
             }
             else if (buf[0] == '9') {
                 buf[nb_recv] = '\0';
-                sender_ip = ntohl(sock.sin_addr.s_addr);
-                known = 0;
                 char pseudo_exp[LBUF] = "inconnu";
-                
-                for (i = 0; i < user_count; i++) {
-                    if (table[i].ip == sender_ip) {
-                        strcpy(pseudo_exp, table[i].pseudo);
-                        known = 1; break;
-                    }
+                struct user_node *curr;
+                for (curr = user_list; curr != NULL; curr = curr->next) {
+                    if (curr->ip == sender_ip) { strcpy(pseudo_exp, curr->pseudo); break; }
                 }
-                if (!known) strcpy(pseudo_exp, addrip(sender_ip));
-
                 pthread_mutex_lock(&mutex_msg);
                 if (nb_msg_attente < MAX_MSGS) {
                     snprintf(boite_reception[nb_msg_attente], LBUF, "message de %s : %s", pseudo_exp, buf + 6);
@@ -197,72 +391,19 @@ void * serveur_udp(void * p) {
                 }
                 pthread_mutex_unlock(&mutex_msg);
             }
-            else if (buf[0] == '6') {
-                /* reception d une requete de fichier : on cherche en local */
-                buf[nb_recv] = '\0';
-                char filepath[256];
-                snprintf(filepath, sizeof(filepath), "reppub/%s", buf + 6);
-                FILE *f = fopen(filepath, "rb");
-                if (f != NULL) {
-                    char header[256];
-                    int hlen = snprintf(header, sizeof(header), "7BEUIP%s|", buf + 6);
-                    memcpy(msg_out, header, hlen);
-                    size_t bytes = fread(msg_out + hlen, 1, LBUF - hlen, f);
-                    fclose(f);
-                    
-                    /* envoi direct a l expediteur en reponse */
-                    sendto(sid_global, msg_out, hlen + bytes, 0, (struct sockaddr *)&sock, ls);
-                }
-            }
-            else if (buf[0] == '7') {
-                /* reception d un fichier depuis le reseau */
-                buf[nb_recv] = '\0'; /* precaution pour strchr */
-                char *delim = strchr(buf + 6, '|');
-                if (delim != NULL) {
-                    *delim = '\0';
-                    char *filename = buf + 6;
-                    char *content = delim + 1;
-                    int content_len = nb_recv - (content - buf);
-                    sender_ip = ntohl(sock.sin_addr.s_addr);
-                    
-                    char savepath[256];
-                    snprintf(savepath, sizeof(savepath), "reppub/%s/%s", addrip(sender_ip), filename);
-                    FILE *out = fopen(savepath, "wb");
-                    if (out != NULL) {
-                        fwrite(content, 1, content_len, out);
-                        fclose(out);
-                        
-                        /* notification a l utilisateur */
-                        pthread_mutex_lock(&mutex_msg);
-                        if (nb_msg_attente < MAX_MSGS) {
-                            snprintf(boite_reception[nb_msg_attente], LBUF, "[fichier] %s telecharge dans reppub/%s/", filename, addrip(sender_ip));
-                            nb_msg_attente++;
-                        }
-                        pthread_mutex_unlock(&mutex_msg);
-                    }
-                }
-            }
             else if (buf[0] == '1' || buf[0] == '2') {
                 buf[nb_recv] = '\0';
-                sender_ip = ntohl(sock.sin_addr.s_addr);
-                strcpy(sender_pseudo, buf + 6);
-                known = 0;
-                for (i = 0; i < user_count; i++) {
-                    if (table[i].ip == sender_ip && strcmp(table[i].pseudo, sender_pseudo) == 0) {
-                        known = 1; break;
-                    }
+                int known = 0;
+                struct user_node *curr;
+                for (curr = user_list; curr != NULL; curr = curr->next) {
+                    if (curr->ip == sender_ip && strcmp(curr->pseudo, buf + 6) == 0) { known = 1; break; }
                 }
-                if (!known && user_count < MAX_USERS) {
-                    table[user_count].ip = sender_ip;
-                    strcpy(table[user_count].pseudo, sender_pseudo);
-                    user_count++;
-                    
-                    snprintf(chemin_user, sizeof(chemin_user), "reppub/%s", addrip(sender_ip));
-                    verifier_repertoire(chemin_user);
+                if (!known) {
+                    add_user(sender_ip, buf + 6);
                 }
                 if (buf[0] == '1') {
                     snprintf(msg_out, LBUF, "2BEUIP%s", pseudo_global);
-                    sendto(sid_global, msg_out, strlen(msg_out), 0, (struct sockaddr *)&sock, ls);
+                    sendto(sid_udp, msg_out, strlen(msg_out), 0, (struct sockaddr *)&sock, ls);
                 }
             }
             pthread_mutex_unlock(&mutex_table);
@@ -288,116 +429,17 @@ char* creer_prompt(void) {
     return prompt;
 }
 
-int CommandeBEUIP(int n, char *p[]) {
-    struct sockaddr_in sock_conf, bcast_addr;
-    char msg_out[LBUF+1];
-    int opt = 1;
-
-    if (n < 2) {
-        fprintf(stderr, "usage : beuip start pseudo | stop\n");
-        return 1;
-    }
-
-    if (strcmp(p[1], "start") == 0) {
-        if (n < 3) {
-            fprintf(stderr, "erreur : pseudo manquant\n");
-            return 1;
-        }
-        if (serveur_actif) {
-            fprintf(stderr, "erreur : le serveur udp tourne deja\n");
-            return 1;
-        }
-
-        strcpy(pseudo_global, p[2]);
-        verifier_repertoire("reppub");
-
-        if ((sid_global = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)) < 0) {
-            perror("socket"); return 1;
-        }
-
-        bzero(&sock_conf, sizeof(sock_conf));
-        sock_conf.sin_family = AF_INET;
-        sock_conf.sin_port = htons(PORT_BEUIP);
-        sock_conf.sin_addr.s_addr = htonl(INADDR_ANY);
-        
-        if (bind(sid_global, (struct sockaddr *)&sock_conf, sizeof(sock_conf)) == -1) {
-            perror("bind"); close(sid_global); return 1;
-        }
-
-        setsockopt(sid_global, SOL_SOCKET, SO_BROADCAST, &opt, sizeof(opt));
-
-        bzero(&bcast_addr, sizeof(bcast_addr));
-        bcast_addr.sin_family = AF_INET;
-        bcast_addr.sin_port = htons(PORT_BEUIP);
-        bcast_addr.sin_addr.s_addr = inet_addr("192.168.88.255");
-        
-        snprintf(msg_out, LBUF, "1BEUIP%s", pseudo_global);
-        sendto(sid_global, msg_out, strlen(msg_out), 0, (struct sockaddr *)&bcast_addr, sizeof(bcast_addr));
-
-        if (pthread_create(&thread_serveur, NULL, serveur_udp, NULL) != 0) {
-            perror("pthread_create"); close(sid_global); return 1;
-        }
-        
-        serveur_actif = 1;
-        printf("serveur udp demarre (thread)\n");
-    } 
-    else if (strcmp(p[1], "stop") == 0) {
-        if (!serveur_actif) {
-            fprintf(stderr, "erreur : aucun serveur actif\n");
-            return 1;
-        }
-
-        commande('0', NULL, NULL);
-
-        close(sid_global);
-        pthread_join(thread_serveur, NULL);
-        
-        pthread_mutex_lock(&mutex_table);
-        user_count = 0;
-        pthread_mutex_unlock(&mutex_table);
-        
-        serveur_actif = 0;
-        printf("serveur udp arrete proprement\n");
-    }
-    return 1;
-}
-
-int CommandeMESS(int n, char *p[]) {
-    if (!serveur_actif) {
-        fprintf(stderr, "erreur : demarrez d abord le reseau\n");
-        return 1;
-    }
-    if (n < 2) {
-        fprintf(stderr, "usage : mess list | mess all <msg> | mess find <fichier> | mess <pseudo> <msg>\n");
-        return 1;
-    }
-
-    if (strcmp(p[1], "list") == 0) commande('3', NULL, NULL);
-    else if (strcmp(p[1], "all") == 0 && n >= 3) commande('5', p[2], NULL);
-    else if (strcmp(p[1], "find") == 0 && n >= 3) commande('6', p[2], NULL);
-    else if (n >= 3) commande('4', p[2], p[1]);
-
-    return 1;
-}
-
 int Sortie(int n, char *p[]) {
     write_history(HIST_FILE);
-    if (serveur_actif) {
-        char *args[] = {"beuip", "stop", NULL};
-        CommandeBEUIP(2, args);
-    }
-    printf("fermeture de biceps. au revoir.\n");
+    clear_history();
+    if (serveur_actif) beuip_stop();
     exit(0);
     return 0;
 }
 
 int CommandeCD(int n, char *p[]) {
-    if (n < 2) {
-        char *home = getenv("HOME");
-        if (home) chdir(home);
-    } else {
-        if (chdir(p[1]) != 0) perror("cd");
-    }
+    if (n < 2) { char *home = getenv("HOME"); if (home && chdir(home) != 0) perror("cd"); } 
+    else if (chdir(p[1]) != 0) perror("cd");
     return 1;
 }
 
@@ -409,7 +451,7 @@ int CommandePWD(int n, char *p[]) {
 }
 
 int CommandeVERS(int n, char *p[]) {
-    printf("biceps version 3.1 - partage de fichiers\n");
+    printf("biceps tp3 complet - tcp integre\n");
     return 1;
 }
 
@@ -419,7 +461,6 @@ void majComInt(void) {
     ajouteCom("pwd", CommandePWD);
     ajouteCom("vers", CommandeVERS);
     ajouteCom("beuip", CommandeBEUIP);
-    ajouteCom("mess", CommandeMESS);
 }
 
 int main(int argc, char *argv[]) {
@@ -434,11 +475,7 @@ int main(int argc, char *argv[]) {
     while (1) {
         pthread_mutex_lock(&mutex_msg);
         if (nb_msg_attente > 0) {
-            printf("\n--- %d notification(s) en attente ---\n", nb_msg_attente);
-            for (k = 0; k < nb_msg_attente; k++) {
-                printf("> %s\n", boite_reception[k]);
-            }
-            printf("------------------------------------\n");
+            for (k = 0; k < nb_msg_attente; k++) printf("> %s\n", boite_reception[k]);
             nb_msg_attente = 0;
         }
         pthread_mutex_unlock(&mutex_msg);
@@ -447,10 +484,7 @@ int main(int argc, char *argv[]) {
         ligne = readline(prompt);
         free(prompt);
 
-        if (ligne == NULL) {
-            printf("\n");
-            Sortie(0, NULL);
-        }
+        if (ligne == NULL) Sortie(0, NULL);
 
         if (strlen(ligne) > 0) {
             add_history(ligne);
