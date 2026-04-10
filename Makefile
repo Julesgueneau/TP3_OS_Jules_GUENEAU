@@ -1,39 +1,25 @@
-# variables de compilation
 CC = cc
-# modifier ici pour activer ou desactiver les traces
-CFLAGS = -Wall -DTRACE
-LDFLAGS = -lreadline
+# Ajout de -Werror comme exige par le prof
+CFLAGS = -Wall -Werror -DTRACE -pthread
+LDFLAGS = -lreadline -pthread
 
-# cibles principales
-all: biceps servbeuip clibeuip servudp cliudp
+all: biceps
 
-# regle pour la gestion des commandes
 gescom.o : gescom.c gescom.h
 	$(CC) $(CFLAGS) -c gescom.c
 
-# programme biceps
-biceps: biceps.c creme.o gescom.o
-	$(CC) $(CFLAGS) -o biceps biceps.c creme.o gescom.o $(LDFLAGS)
-
-# serveur beuip
-servbeuip: servbeuip.c creme.o
-	$(CC) $(CFLAGS) -o servbeuip servbeuip.c creme.o
-
-# client beuip
-clibeuip: clibeuip.c creme.o
-	$(CC) $(CFLAGS) -o clibeuip clibeuip.c creme.o
-
-# bibliotheque creme
 creme.o: creme.c creme.h
 	$(CC) $(CFLAGS) -c creme.c
 
-# utilitaires udp
-servudp: servudp.c
-	$(CC) $(CFLAGS) -o servudp servudp.c
+biceps: biceps.c creme.o gescom.o
+	$(CC) $(CFLAGS) -o biceps biceps.c creme.o gescom.o $(LDFLAGS)
 
-cliudp: cliudp.c
-	$(CC) $(CFLAGS) -o cliudp cliudp.c
+# Cible specifique pour Valgrind
+memory-leak:
+	$(CC) -Wall -Werror -DTRACE -pthread -g -O0 -c gescom.c
+	$(CC) -Wall -Werror -DTRACE -pthread -g -O0 -c creme.c
+	$(CC) -Wall -Werror -DTRACE -pthread -g -O0 -c biceps.c
+	$(CC) -Wall -Werror -DTRACE -pthread -g -O0 -o biceps-memory-leaks biceps.o creme.o gescom.o $(LDFLAGS)
 
-# nettoyage
 clean:
-	rm -f *.o biceps servbeuip clibeuip servudp cliudp
+	rm -f *.o biceps biceps-memory-leaks
