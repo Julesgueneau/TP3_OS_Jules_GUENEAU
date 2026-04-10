@@ -20,7 +20,7 @@
 #define BCAST_IP "192.168.88.255"
 #define PORT_TCP 9998
 
-/* definition de la structure de liste chainee (conformite tp3 prof) */
+/* definition de la structure de liste chainee */
 struct user_node {
     unsigned long ip;
     char pseudo[LBUF];
@@ -142,7 +142,7 @@ void beuip_message(int n, char *p[]) {
     pthread_mutex_unlock(&mutex_table);
 }
 
-/* section 3.2 : recuperation de la liste du repertoire via tcp */
+/* recuperation de la liste du repertoire via tcp */
 void demandeListe(char *pseudo) {
     unsigned long ip = find_ip_by_pseudo(pseudo);
     if (!ip) { printf("erreur : pseudo %s introuvable.\n", pseudo); return; }
@@ -170,7 +170,7 @@ void demandeListe(char *pseudo) {
     close(sock);
 }
 
-/* section 3.3 : telechargement de fichier via tcp */
+/* telechargement de fichier via tcp */
 void demandeFichier(char *pseudo, char *nomfic) {
     char savepath[512];
     snprintf(savepath, sizeof(savepath), "reppub/%s", nomfic);
@@ -224,7 +224,6 @@ int beuip_start(char *pseudo) {
     pseudo_global[LBUF-1] = '\0';
     verifier_repertoire("reppub");
 
-    /* initialisation udp */
     if ((sid_udp = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)) < 0) return 1;
     memset(&sock_conf, 0, sizeof(sock_conf));
     sock_conf.sin_family = AF_INET;
@@ -233,7 +232,6 @@ int beuip_start(char *pseudo) {
     if (bind(sid_udp, (struct sockaddr *)&sock_conf, sizeof(sock_conf)) == -1) return 1;
     setsockopt(sid_udp, SOL_SOCKET, SO_BROADCAST, &opt, sizeof(opt));
 
-    /* annonce de presence sur le broadcast */
     memset(&bcast_addr, 0, sizeof(bcast_addr));
     bcast_addr.sin_family = AF_INET;
     bcast_addr.sin_port = htons(PORT_BEUIP);
@@ -241,7 +239,6 @@ int beuip_start(char *pseudo) {
     snprintf(msg_out, LBUF, "1BEUIP%s", pseudo_global);
     sendto(sid_udp, msg_out, strlen(msg_out), 0, (struct sockaddr *)&bcast_addr, sizeof(bcast_addr));
 
-    /* lancement des deux threads serveurs */
     serveur_actif = 1;
     pthread_create(&thread_serveur_udp, NULL, serveur_udp, NULL);
     pthread_create(&thread_serveur_tcp, NULL, serveur_tcp, NULL);
@@ -254,9 +251,8 @@ int beuip_stop(void) {
     struct user_node *curr;
 
     if (!serveur_actif) return 1;
-    serveur_actif = 0; /* signale aux threads de s arreter */
+    serveur_actif = 0;
 
-    /* depart propre via unicast udp */
     pthread_mutex_lock(&mutex_table);
     for (curr = user_list; curr != NULL; curr = curr->next) {
         memset(&dest, 0, sizeof(dest));
@@ -271,7 +267,6 @@ int beuip_stop(void) {
 
     close(sid_udp);
     
-    /* connexion factice pour debloquer le accept du serveur tcp */
     int dummy = socket(AF_INET, SOCK_STREAM, 0);
     struct sockaddr_in sin;
     memset(&sin, 0, sizeof(sin));
@@ -298,7 +293,7 @@ int CommandeBEUIP(int n, char *p[]) {
     return 1;
 }
 
-/* logique d expediteur tcp appelee par le thread tcp (sections 3.2 et 3.3) */
+/* logique d expediteur tcp appelee par le thread tcp */
 void envoiContenu(int fd) {
     char cmd;
     if (read(fd, &cmd, 1) <= 0) return;
@@ -309,7 +304,7 @@ void envoiContenu(int fd) {
             execlp("ls", "ls", "-l", "reppub/", NULL);
             exit(1);
         }
-        wait(NULL); /* evite les processus zombies */
+        wait(NULL);
     } 
     else if (cmd == 'F') {
         char nomfic[256];
@@ -327,7 +322,7 @@ void envoiContenu(int fd) {
     }
 }
 
-/* thread tcp sur le port 9998 (section 3.1) */
+/* thread tcp sur le port 9998 */
 void * serveur_tcp(void * p) {
     int fd;
     struct sockaddr_in sin;
@@ -355,7 +350,7 @@ void * serveur_tcp(void * p) {
     return NULL;
 }
 
-/* thread udp pour l intercommunication beuip */
+/* thread udp mis a jour avec les accuses de reception (code a) */
 void * serveur_udp(void * p) {
     int nb_recv;
     struct sockaddr_in sock;
@@ -369,7 +364,7 @@ void * serveur_udp(void * p) {
         if (nb_recv <= 0) break;
         
         if (nb_recv >= 6 && strncmp(buf + 1, "BEUIP", 5) == 0) {
-            if (buf[0] != '0' && buf[0] != '1' && buf[0] != '2' && buf[0] != '9') continue;
+            if (buf[0] != '0' && buf[0] != '1' && buf[0] != '2' && buf[0] != '9' && buf[0] != 'A') continue;
             
             pthread_mutex_lock(&mutex_table);
             sender_ip = ntohl(sock.sin_addr.s_addr);
@@ -384,9 +379,24 @@ void * serveur_udp(void * p) {
                 for (curr = user_list; curr != NULL; curr = curr->next) {
                     if (curr->ip == sender_ip) { strcpy(pseudo_exp, curr->pseudo); break; }
                 }
+                
                 pthread_mutex_lock(&mutex_msg);
                 if (nb_msg_attente < MAX_MSGS) {
                     snprintf(boite_reception[nb_msg_attente], LBUF, "message de %s : %s", pseudo_exp, buf + 6);
+                    nb_msg_attente++;
+                }
+                pthread_mutex_unlock(&mutex_msg);
+
+                /* reponse automatique : envoi de l accuse de reception */
+                snprintf(msg_out, LBUF, "ABEUIP%s", pseudo_global);
+                sendto(sid_udp, msg_out, strlen(msg_out), 0, (struct sockaddr *)&sock, ls);
+            }
+            else if (buf[0] == 'A') {
+                /* traitement de l accuse de reception recu */
+                buf[nb_recv] = '\0';
+                pthread_mutex_lock(&mutex_msg);
+                if (nb_msg_attente < MAX_MSGS) {
+                    snprintf(boite_reception[nb_msg_attente], LBUF, "[lu par %s]", buf + 6);
                     nb_msg_attente++;
                 }
                 pthread_mutex_unlock(&mutex_msg);
@@ -451,7 +461,7 @@ int CommandePWD(int n, char *p[]) {
 }
 
 int CommandeVERS(int n, char *p[]) {
-    printf("biceps tp3 complet - tcp integre\n");
+    printf("biceps tp3 complet - tcp integre et ack actif\n");
     return 1;
 }
 
